@@ -23,8 +23,8 @@ use revm::{
         pre_execution::{calculate_caller_fee, validate_account_nonce_and_code_with_components},
     },
     inspector::{Inspector, InspectorEvmTr, InspectorHandler},
-    interpreter::{Gas, interpreter::EthInterpreter, interpreter_action::FrameInit},
-    primitives::{U256, hardfork::SpecId},
+    interpreter::{gas::GasTracker, interpreter::EthInterpreter, interpreter_action::FrameInit},
+    primitives::U256,
 };
 
 use crate::{
@@ -185,42 +185,29 @@ where
     fn last_frame_result(
         &mut self,
         evm: &mut Self::Evm,
-        _original_reservoir: u64,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
+        parent_gas: &mut GasTracker,
     ) -> Result<(), Self::Error> {
         let ctx = evm.ctx();
         let tx = ctx.tx();
         let is_deposit = tx.tx_type() == DEPOSIT_TRANSACTION_TYPE;
+        let is_system_transaction = tx.is_system_transaction();
         let tx_gas_limit = tx.gas_limit();
         let is_regolith = ctx.cfg().spec().is_enabled_in(BaseUpgrade::Regolith);
+        let instruction_result = frame_result.instruction_result();
 
-        let instruction_result = frame_result.interpreter_result().result;
-        let gas = frame_result.gas_mut();
-        let remaining = gas.remaining();
-        let refunded = gas.refunded();
-        let reservoir = gas.reservoir();
-        let state_gas_spent = gas.state_gas_spent();
+        self.mainnet.last_frame_result(evm, frame_result, parent_gas)?;
 
-        // Spend the gas limit. Gas is reimbursed when the tx returns successfully.
-        *gas = Gas::new_spent_with_reservoir(tx_gas_limit, reservoir);
-
-        if instruction_result.is_ok() {
-            if !is_deposit || is_regolith {
-                gas.erase_cost(remaining);
-                gas.record_refund(refunded);
-            } else if is_deposit && tx.is_system_transaction() {
-                gas.erase_cost(tx_gas_limit);
+        // Pre-Regolith deposits cannot receive unused gas or refunds from the frame settlement.
+        if is_deposit && !is_regolith {
+            parent_gas.spend_all();
+            parent_gas.set_refunded(0);
+            if is_system_transaction && instruction_result.is_ok() {
+                parent_gas.erase_cost(tx_gas_limit);
             }
-        } else if instruction_result.is_revert() && (!is_deposit || is_regolith) {
-            gas.erase_cost(remaining);
         }
 
-        if instruction_result.is_ok() {
-            gas.set_state_gas_spent(state_gas_spent);
-        } else {
-            gas.set_state_gas_spent(0);
-            gas.set_reservoir(reservoir.saturating_add_signed(state_gas_spent));
-        }
+        *frame_result.gas_mut().tracker_mut() = *parent_gas;
 
         Ok(())
     }
@@ -247,7 +234,7 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
         eip7702_refund: i64,
-    ) {
+    ) -> Result<(), Self::Error> {
         frame_result.gas_mut().record_refund(eip7702_refund);
 
         let is_deposit = evm.ctx().tx().tx_type() == DEPOSIT_TRANSACTION_TYPE;
@@ -256,10 +243,12 @@ where
         // Prior to Regolith, deposit transactions did not receive gas refunds.
         let is_gas_refund_disabled = is_deposit && !is_regolith;
         if !is_gas_refund_disabled {
-            frame_result.gas_mut().set_final_refund(
-                evm.ctx().cfg().spec().into_eth_spec().is_enabled_in(SpecId::LONDON),
-            );
+            frame_result
+                .gas_mut()
+                .set_final_refund(evm.ctx().cfg().gas_params().max_refund_quotient());
         }
+
+        Ok(())
     }
 
     fn reward_beneficiary(
@@ -423,7 +412,7 @@ mod tests {
         database_interface::EmptyDB,
         handler::{EthFrame, Handler},
         inspector::NoOpInspector,
-        interpreter::{CallOutcome, InstructionResult, InterpreterResult},
+        interpreter::{CallOutcome, Gas, InstructionResult, InterpreterResult},
         primitives::{Address, B256, Bytes, TxKind, bytes, hardfork::SpecId},
         state::AccountInfo,
     };
@@ -447,8 +436,10 @@ mod tests {
         let mut handler =
             BaseHandler::<_, EVMError<_, BaseTransactionError>, EthFrame<EthInterpreter>>::new();
 
-        handler.last_frame_result(&mut evm, 0, &mut exec_result).unwrap();
-        handler.refund(&mut evm, &mut exec_result, 0);
+        let gas_limit = evm.ctx().tx().gas_limit();
+        let mut parent_gas = GasTracker::new(gas_limit, gas_limit, 0);
+        handler.last_frame_result(&mut evm, &mut exec_result, &mut parent_gas).unwrap();
+        handler.refund(&mut evm, &mut exec_result, 0).unwrap();
         *exec_result.gas()
     }
 
